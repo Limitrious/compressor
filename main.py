@@ -61,6 +61,17 @@ def save_config(data):
     except:
         console.print("[yellow]Warning: could not save config[/yellow]")
 
+def detect_nvenc():
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-encoders"],
+            capture_output=True,
+            text=True
+        )
+        return "h264_nvenc" in result.stdout
+    except:
+        return False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FFmpeg & MEDIA HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -101,14 +112,207 @@ def get_preset(level: str, encoder: str) -> str:
 # COMPRESSION FUNCTIONS — with saturation support
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compress_video_animation(inp: str, out: str, target_mib: int, level: str, fmt: dict, info: dict, saturation: float):
+def compress_video_animation(inp, out, target_mib, level, fmt, info, saturation, use_2pass, use_gpu, use_scene):
     duration = float(info["format"].get("duration", 60))
-
-    audio_kbps = 64 if target_mib <= 20 else 96
+    input_size_mib = Path(inp).stat().st_size / 1_048_576
 
     total_kbps = int((target_mib * 8192) / duration)
+    target_kbps_video = int(total_kbps * 0.88)
 
-    target_kbps_video = max(100, total_kbps - audio_kbps)
+    # dynamic audio scaling
+    audio_kbps = min(128, max(32, int(total_kbps * 0.12)))
+    audio_bitrate = f"{audio_kbps}k"
+
+    # scaling (less aggressive, keeps quality)
+    ratio = target_mib / max(input_size_mib, 1)
+    scale_factor = min(1.0, ratio ** 0.8)
+
+    v = next((s for s in info["streams"] if s["codec_type"] == "video"), {})
+    w, h = int(v.get("width", 1920)), int(v.get("height", 1080))
+
+    new_w = max(426, int(w * scale_factor / 2) * 2)
+    new_h = max(240, int(h * scale_factor / 2) * 2)
+
+    scale_filter = f"scale={new_w}:{new_h}:force_original_aspect_ratio=decrease"
+    pad_filter = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+
+    vf_parts = [scale_filter, pad_filter]
+
+    if saturation != 100:
+        vf_parts.append(f"eq=saturation={saturation/100:.2f}")
+
+    vf = ",".join(vf_parts)
+
+    name = fmt["name"]
+
+    # codec selection
+    if name == "MP4":
+        vcodec = "h264_nvenc" if use_gpu else "libx264"
+        acodec = "aac"
+    elif name == "WebM":
+        vcodec = "libvpx-vp9"
+        acodec = "libopus"
+    else:
+        vcodec = "libsvtav1"
+        acodec = "libopus"
+
+    # ─────────────────────────────
+    # SCENE COMPLEXITY
+    # ─────────────────────────────
+    complexity = 1.0
+    if use_scene:
+        try:
+            probe = subprocess.run([
+                "ffmpeg", "-i", inp,
+                "-vf", "select='gt(scene,0.4)',showinfo",
+                "-f", "null", "-"
+            ], stderr=subprocess.PIPE, text=True)
+
+            scenes = probe.stderr.count("showinfo")
+            complexity = min(2.0, 1 + scenes / 50)
+        except:
+            pass
+
+    # ─────────────────────────────
+    # BINARY SEARCH BITRATE
+    # ─────────────────────────────
+    target_bytes = target_mib * 1024 * 1024
+
+    low = int(total_kbps * 0.3)
+    high = int(total_kbps * 2.0)
+
+    best_file = None
+    best_diff = float("inf")
+
+    temp_out = out + ".temp.mp4"
+
+    def encode(kbps, pass_mode=False):
+        kbps = int(kbps * complexity)
+
+        if use_2pass and pass_mode:
+            null = "NUL" if os.name == "nt" else "/dev/null"
+
+            subprocess.run([
+                "ffmpeg", "-y", "-i", inp,
+                "-vf", vf,
+                "-c:v", vcodec,
+                "-b:v", f"{kbps}k",
+                "-pass", "1",
+                "-an",
+                "-f", "matroska",
+                null
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            subprocess.run([
+                "ffmpeg", "-y", "-i", inp,
+                "-vf", vf,
+                "-c:v", vcodec,
+                "-b:v", f"{kbps}k",
+                "-pass", "2",
+                "-c:a", acodec,
+                "-b:a", audio_bitrate,
+                temp_out
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", inp,
+                "-vf", vf,
+                "-c:v", vcodec,
+                "-b:v", f"{kbps}k",
+                "-c:a", acodec,
+                "-b:a", audio_bitrate,
+                temp_out
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        return Path(temp_out).stat().st_size
+
+    # binary search loop
+    for _ in range(6):
+        mid = (low + high) // 2
+
+        try:
+            size = encode(mid, pass_mode=True)
+        except:
+            break
+
+        diff = abs(size - target_bytes)
+
+        if diff < best_diff:
+            best_diff = diff
+            if best_file:
+                os.remove(best_file)
+            best_file = temp_out + ".best"
+            shutil.copy(temp_out, best_file)
+
+        if size > target_bytes:
+            high = mid
+        else:
+            low = mid
+
+    final_file = best_file if best_file and os.path.exists(best_file) else temp_out
+    final_size = Path(final_file).stat().st_size
+
+    if final_size > target_bytes * 1.05:
+        console.print("[yellow]Bitrate targeting failed → switching to CRF fallback[/yellow]")
+
+        crf = 28
+        while True:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", inp,
+                "-vf", vf,
+                "-c:v", "libx264",
+                "-crf", str(crf),
+                "-preset", get_preset(level, "x264"),
+                "-c:a", acodec,
+                "-b:a", audio_bitrate,
+                temp_out
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            size = Path(temp_out).stat().st_size
+
+            if size <= target_bytes * 1.02 or crf >= 40:
+                shutil.move(temp_out, out)
+                break
+
+            crf += 2
+    else:
+        shutil.move(final_file, out)
+        
+    # ─────────────────────────────
+    # FINAL HARD RETRY (AFTER EVERYTHING)
+    # ─────────────────────────────
+    for _ in range(3):
+        if not os.path.exists(out):
+            break
+
+        size = Path(out).stat().st_size / 1_048_576
+
+        if size <= target_mib * 1.02:
+            break
+
+        console.print(f"[yellow]Final retry: {size:.2f} MiB → reducing bitrate[/yellow]")
+
+        total_kbps = int(total_kbps * 0.85)
+
+        subprocess.run([
+            "ffmpeg", "-y", "-i", inp,
+            "-vf", vf,
+            "-c:v", vcodec,
+            "-b:v", f"{int(total_kbps * complexity)}k",
+            "-c:a", acodec,
+            "-b:a", audio_bitrate,
+            out
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+    # cleanup
+    for f in ("ffmpeg2pass-0.log", "ffmpeg2pass-0.log.mbtree"):
+        if os.path.exists(f):
+            os.remove(f)
+
+    if os.path.exists(temp_out):
+        os.remove(temp_out)
+
 
     audio_bitrate = f"{audio_kbps}k"
 
@@ -135,68 +339,6 @@ def compress_video_animation(inp: str, out: str, target_mib: int, level: str, fm
     vf = ",".join(vf_parts)
 
     name = fmt["name"]
-
-    # ─────────────────────────────────────────────────────────────
-    # 2-PASS ENCODING
-    # ─────────────────────────────────────────────────────────────
-
-    if name in ("MP4", "AV1 MKV", "WebM"):
-        if name == "MP4":
-            vcodec = "libx264"
-            acodec = "aac"
-            preset = get_preset(level, "x264")
-            null = "NUL" if os.name == "nt" else "/dev/null"
-
-        elif name == "AV1 MKV":
-            vcodec = "libsvtav1"
-            acodec = "libopus"
-            preset = get_preset(level, "svtav1")
-            null = "NUL" if os.name == "nt" else "/dev/null"
-
-        elif name == "WebM":
-            vcodec = "libvpx-vp9"
-            acodec = "libopus"
-            preset = get_preset(level, "vp9")
-            null = "NUL" if os.name == "nt" else "/dev/null"
-
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", inp,
-            "-vf", vf,
-            "-c:v", vcodec,
-            "-b:v", f"{target_kbps_video}k",
-            "-preset", preset,
-            "-pass", "1",
-            "-an",
-            "-f", "matroska",
-            null
-        ], check=True)
-
-        subprocess.run([
-            "ffmpeg",
-            "-i", inp,
-            "-vf", vf,
-            "-c:v", vcodec,
-            "-b:v", f"{target_kbps_video}k",
-            "-preset", preset,
-            "-pass", "2",
-            "-c:a", acodec,
-            "-b:a", audio_bitrate,
-            "-y", out
-        ], check=True)
-
-        for f in ("ffmpeg2pass-0.log", "ffmpeg2pass-0.log.mbtree"):
-            if os.path.exists(f):
-                os.remove(f)
-
-    else:
-        fps = "12" if target_mib <= 8 else "15" if target_mib <= 15 else "24"
-        subprocess.run([
-            "ffmpeg", "-i", inp,
-            "-vf", f"fps={fps},{vf}",
-            "-loop", "0",
-            "-y", out
-        ], check=True)
 
 def compress_audio(inp: str, out: str, target_mib: int, level: str, fmt: dict, saturation: float):
     target_kbps = max(32, int(target_mib * 1024 * 8 / 180))
@@ -248,6 +390,9 @@ def compress_image(inp: str, out: str, target_mib: int, level: str, fmt: dict, s
 
         q = max(25, q - 18)
         scale *= 0.78
+    
+       
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -263,6 +408,10 @@ def main():
     ))
 
     config = load_config()
+    config.setdefault("two_pass", True)
+    config.setdefault("gpu", False)
+    config.setdefault("scene_detect", True)
+    save_config(config)
     remembered_folder = config.get("output_folder")
 
     # ── Input file loop ──────────────────────────────────────────────────────
@@ -356,12 +505,51 @@ def main():
         return
 
     two_pass_raw = questionary.text(
-        "Use 2-pass encoding? (Y/n) — Enter = Yes",
-        default="y"
+        f"2-pass encoding? (Y/n) [default: {'Y' if config['two_pass'] else 'N'}]",
+        default="y" if config["two_pass"] else "n"
     ).ask().strip().lower()
 
     use_2pass = not (two_pass_raw == "n")
+    config["two_pass"] = use_2pass
+    save_config(config)
+
     console.print(f"→ 2-pass: [bold]{'ON' if use_2pass else 'OFF'}[/]")
+
+    gpu_raw = questionary.text(
+        f"GPU encoding? (y/N) [default: {'Y' if config['gpu'] else 'N'}]",
+        default="y" if config["gpu"] else "n"
+    ).ask().strip().lower()
+
+    nvenc_available = detect_nvenc()
+
+    if gpu_raw == "y" and not nvenc_available:
+        console.print("[yellow]NVENC not available → falling back to CPU[/yellow]")
+        use_gpu = False
+    else:
+        use_gpu = (gpu_raw == "y")
+        
+    config["gpu"] = use_gpu
+    save_config(config)
+
+    if use_gpu and use_2pass:
+        console.print("[yellow]GPU encoding does not support true 2-pass → disabling 2-pass[/yellow]")
+        use_2pass = False
+        config["two_pass"] = False
+        save_config(config)
+        console.print(f"→ 2-pass: [bold]{'ON' if use_2pass else 'OFF'}[/]")
+
+    console.print(f"→ GPU: [bold]{'ON' if use_gpu else 'OFF'}[/]")
+
+    scene_raw = questionary.text(
+        f"Scene complexity detection? (Y/n) [default: {'Y' if config['scene_detect'] else 'N'}]",
+        default="y" if config["scene_detect"] else "n"
+    ).ask().strip().lower()
+
+    use_scene = not (scene_raw == "n")
+    config["scene_detect"] = use_scene
+    save_config(config)
+    
+    console.print(f"→ Scene complexity detection: [bold]{'ON' if use_scene else 'OFF'}[/]")
     
     saturation_raw = questionary.text(
         "Saturation multiplier (%) — press Enter for 100%",
@@ -391,10 +579,10 @@ def main():
     else:
         console.print(f"→ Saving as: [bold]{out.name}[/]")
 
-    with console.status("[bold green]Compressing... (may take a while)", spinner="dots8Bit"):
+    with console.status("[bold green]Compressing... (may take a while)", spinner="dots12"):
         try:
             if kind in ("video", "animation"):
-                compress_video_animation(str(input_path), str(out), target_mib, level, fmt, info, saturation)
+                compress_video_animation(str(input_path),str(out),target_mib,level,fmt,info,saturation,use_2pass,use_gpu,use_scene)
             elif kind == "audio":
                 compress_audio(str(input_path), str(out), target_mib, level, fmt, saturation)
             elif kind == "image":

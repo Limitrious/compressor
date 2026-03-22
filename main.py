@@ -190,7 +190,6 @@ def compress_video_animation(inp: str, out: str, target_mib: int, level: str, fm
                 os.remove(f)
 
     else:
-        # fallback (GIF/APNG)
         fps = "12" if target_mib <= 8 else "15" if target_mib <= 15 else "24"
         subprocess.run([
             "ffmpeg", "-i", inp,
@@ -305,7 +304,6 @@ def main():
 
     input_path = Path(inp_path)
 
-    # Decide output folder
     if remembered_folder:
         output_folder = Path(remembered_folder)
     else:
@@ -318,7 +316,6 @@ def main():
     kind = detect_type(info)
     console.print(f"→ Detected: [bold]{kind.upper()}[/]")
 
-    # Target size
     size_choices = [
         "1 MiB",
         "8 MiB",
@@ -344,7 +341,6 @@ def main():
 
     console.print(f"→ Target: [bold]{target_mib} MiB[/]")
 
-    # Format
     fmt_choices = [f"{f['name']}  •  {f['group']}" for f in FORMATS]
     fmt_str = questionary.select("Output format", choices=fmt_choices).ask()
     if fmt_str is None:
@@ -352,7 +348,6 @@ def main():
     fmt_name = fmt_str.split("  •  ")[0]
     fmt = next(f for f in FORMATS if f["name"] == fmt_name)
 
-    # Compression level
     level = questionary.select(
         "Compression level (speed ↔ quality)",
         choices=COMPRESSION_LEVELS
@@ -360,7 +355,14 @@ def main():
     if level is None:
         return
 
-    # ── NEW: Saturation adjustment ───────────────────────────────────────────
+    two_pass_raw = questionary.text(
+        "Use 2-pass encoding? (Y/n) — Enter = Yes",
+        default="y"
+    ).ask().strip().lower()
+
+    use_2pass = not (two_pass_raw == "n")
+    console.print(f"→ 2-pass: [bold]{'ON' if use_2pass else 'OFF'}[/]")
+    
     saturation_raw = questionary.text(
         "Saturation multiplier (%) — press Enter for 100%",
         default="100"
@@ -389,7 +391,6 @@ def main():
     else:
         console.print(f"→ Saving as: [bold]{out.name}[/]")
 
-    # Compress
     with console.status("[bold green]Compressing... (may take a while)", spinner="dots8Bit"):
         try:
             if kind in ("video", "animation"):

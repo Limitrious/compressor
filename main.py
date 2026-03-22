@@ -103,37 +103,103 @@ def get_preset(level: str, encoder: str) -> str:
 
 def compress_video_animation(inp: str, out: str, target_mib: int, level: str, fmt: dict, info: dict, saturation: float):
     duration = float(info["format"].get("duration", 60))
-    target_kbps_video = max(150, int((target_mib * 0.85) * 8192 / duration))
-    audio_bitrate = "64k" if target_mib <= 20 else "96k"
+
+    audio_kbps = 64 if target_mib <= 20 else 96
+
+    total_kbps = int((target_mib * 8192) / duration)
+
+    target_kbps_video = max(100, total_kbps - audio_kbps)
+
+    audio_bitrate = f"{audio_kbps}k"
+
+    input_size_mib = Path(inp).stat().st_size / 1_048_576
+    ratio = target_mib / max(input_size_mib, 1)
+
+    scale_factor = min(1.0, ratio ** 0.75)
 
     v = next((s for s in info["streams"] if s["codec_type"] == "video"), {})
     w, h = int(v.get("width", 1920)), int(v.get("height", 1080))
-    scale_factor = min(1.0, (target_mib / max(Path(inp).stat().st_size / 1_048_576, 1)) ** 0.5)
-    new_w = max(320, int(w * scale_factor / 2) * 2)
-    new_h = max(180, int(h * scale_factor / 2) * 2)
-    scale_filter = f"scale={new_w}:{new_h}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2" if scale_factor < 0.95 else "null"
 
-    sat_filter = f"eq=saturation={saturation/100:.2f}" if saturation != 100 else "null"
-    vf = f"{scale_filter},{sat_filter}" if scale_filter != "null" or sat_filter != "null" else "null"
+    new_w = max(426, int(w * scale_factor / 2) * 2)
+    new_h = max(240, int(h * scale_factor / 2) * 2)
+
+    scale_filter = f"scale={new_w}:{new_h}:force_original_aspect_ratio=decrease"
+    pad_filter = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+
+    sat_filter = f"eq=saturation={saturation/100:.2f}" if saturation != 100 else None
+
+    vf_parts = [scale_filter, pad_filter]
+    if sat_filter:
+        vf_parts.append(sat_filter)
+
+    vf = ",".join(vf_parts)
 
     name = fmt["name"]
-    if name == "AV1 MKV":
-        cmd = ["ffmpeg", "-i", inp, "-vf", vf, "-c:v", "libsvtav1", "-preset", get_preset(level, "svtav1"), "-crf", "34" if level == "normal" else "30",
-               "-b:v", f"{target_kbps_video}k", "-c:a", "libopus", "-b:a", audio_bitrate, "-y", out]
-    elif name == "MP4":
-        cmd = ["ffmpeg", "-i", inp, "-vf", vf, "-c:v", "libx264", "-preset", get_preset(level, "x264"), "-crf", "26" if level == "normal" else "23",
-               "-b:v", f"{target_kbps_video}k", "-c:a", "aac", "-b:a", audio_bitrate, "-y", out]
-    elif name == "WebM":
-        cmd = ["ffmpeg", "-i", inp, "-vf", vf, "-c:v", "libvpx-vp9", "-b:v", f"{target_kbps_video}k",
-               "-c:a", "libopus", "-b:a", audio_bitrate, "-y", out]
-    else:  # GIF / APNG
-        fps = "12" if target_mib <= 8 else "15" if target_mib <= 15 else "24"
-        cmd = ["ffmpeg", "-i", inp, "-vf", f"fps={fps},{scale_filter},{sat_filter}", "-loop", "0", "-y", out]
 
-    subprocess.run(cmd, check=True)
+    # ─────────────────────────────────────────────────────────────
+    # 2-PASS ENCODING
+    # ─────────────────────────────────────────────────────────────
+
+    if name in ("MP4", "AV1 MKV", "WebM"):
+        if name == "MP4":
+            vcodec = "libx264"
+            acodec = "aac"
+            preset = get_preset(level, "x264")
+            null = "NUL" if os.name == "nt" else "/dev/null"
+
+        elif name == "AV1 MKV":
+            vcodec = "libsvtav1"
+            acodec = "libopus"
+            preset = get_preset(level, "svtav1")
+            null = "NUL" if os.name == "nt" else "/dev/null"
+
+        elif name == "WebM":
+            vcodec = "libvpx-vp9"
+            acodec = "libopus"
+            preset = get_preset(level, "vp9")
+            null = "NUL" if os.name == "nt" else "/dev/null"
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", inp,
+            "-vf", vf,
+            "-c:v", vcodec,
+            "-b:v", f"{target_kbps_video}k",
+            "-preset", preset,
+            "-pass", "1",
+            "-an",
+            "-f", "matroska",
+            null
+        ], check=True)
+
+        subprocess.run([
+            "ffmpeg",
+            "-i", inp,
+            "-vf", vf,
+            "-c:v", vcodec,
+            "-b:v", f"{target_kbps_video}k",
+            "-preset", preset,
+            "-pass", "2",
+            "-c:a", acodec,
+            "-b:a", audio_bitrate,
+            "-y", out
+        ], check=True)
+
+        for f in ("ffmpeg2pass-0.log", "ffmpeg2pass-0.log.mbtree"):
+            if os.path.exists(f):
+                os.remove(f)
+
+    else:
+        # fallback (GIF/APNG)
+        fps = "12" if target_mib <= 8 else "15" if target_mib <= 15 else "24"
+        subprocess.run([
+            "ffmpeg", "-i", inp,
+            "-vf", f"fps={fps},{vf}",
+            "-loop", "0",
+            "-y", out
+        ], check=True)
 
 def compress_audio(inp: str, out: str, target_mib: int, level: str, fmt: dict, saturation: float):
-    # saturation doesn't apply to audio → ignore
     target_kbps = max(32, int(target_mib * 1024 * 8 / 180))
     name = fmt["name"]
     if name == "MP3":

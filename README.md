@@ -1,4 +1,4 @@
-# Smart Auto Media Compressor
+# Smart Media Compressor
 
 A simple, offline, FFmpeg-based media compressor with a console interface.
 

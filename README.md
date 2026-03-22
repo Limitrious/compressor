@@ -108,7 +108,7 @@ Compress videos, images, GIFs, and audio files to a target file size with smart 
 
 ## Example run
 
-
+![example](https://raw.githubusercontent.com/Limitrious/compressor/refs/heads/main/example.png)
 
 ## Notes
 

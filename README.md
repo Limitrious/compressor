@@ -4,10 +4,6 @@ A simple, offline, FFmpeg-based media compressor with a console interface.
 
 Compress videos, images, GIFs, and audio files to a target file size with smart quality and size trade-offs.
 
-**Now also available as a standalone EXE** — no Python, FFmpeg installation, or other dependencies required. Just download and run. (but it's slower)
-
-[**Release**](https://github.com/Limitrious/compressor/releases/tag/v1)
-
 ## Features
 
 * Target file size selection (quick presets + custom)

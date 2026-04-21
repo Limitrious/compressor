@@ -438,7 +438,7 @@ def compress_one(config: dict) -> dict:
         inp_raw = questionary.path(
             "Input file (press Enter to change output folder)",
             default=""
-        ).ask().strip()
+        ).ask().strip().strip('"').strip("'")
 
         if inp_raw == "":
             current = remembered_folder or str(DEFAULT_OUTPUT_FOLDER)

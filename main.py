@@ -89,8 +89,6 @@ def get_media_info(path: str) -> dict:
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return json.loads(result.stdout)
 
-# FIX: improved image detection — use nb_frames and codec_name
-#      rather than absence of "duration" (which ffprobe often includes anyway)
 IMAGE_CODECS = {
     "png", "mjpeg", "jpeg", "webp", "bmp", "tiff", "gif",
     "dpx", "exr", "pam", "pbm", "pgm", "ppm", "sgi",
@@ -104,7 +102,6 @@ def detect_type(info: dict) -> str:
     if not video_streams:
         return "audio" if has_audio else "unknown"
 
-    # A stream is an image if its codec is an image codec AND it has exactly 1 frame
     def is_image_stream(s: dict) -> bool:
         return (
             s.get("codec_name", "").lower() in IMAGE_CODECS
@@ -207,6 +204,8 @@ def compress_video_animation(inp, out, target_mib, level, fmt, info, saturation,
 
     temp_out = out + ".temp.mp4"
 
+    BINARY_SEARCH_ITERATIONS = 6
+
     def encode(kbps: int, pass_mode: bool = False) -> int:
         kbps = int(kbps * complexity)
 
@@ -248,19 +247,28 @@ def compress_video_animation(inp, out, target_mib, level, fmt, info, saturation,
         return Path(temp_out).stat().st_size
 
     # binary search loop
-    for _ in range(6):
+    for i in range(BINARY_SEARCH_ITERATIONS):
         mid = (low + high) // 2
+        console.print(
+            f"[dim]  Binary search pass {i + 1}/{BINARY_SEARCH_ITERATIONS} "
+            f"— trying {mid} kbps (range {low}–{high})[/dim]"
+        )
 
         try:
             size = encode(mid, pass_mode=True)
         except Exception:
             break
 
+        size_mib = size / 1_048_576
         diff = abs(size - target_bytes)
+        over_or_under = "over" if size > target_bytes else "under"
+        console.print(
+            f"[dim]    → {size_mib:.2f} MiB ({over_or_under} target by "
+            f"{abs(size_mib - target_mib):.2f} MiB)[/dim]"
+        )
 
         if diff < best_diff:
             best_diff = diff
-            # FIX: only remove previous best after we've confirmed the new temp file exists
             new_best = temp_out + ".best"
             try:
                 shutil.copy(temp_out, new_best)
@@ -275,7 +283,6 @@ def compress_video_animation(inp, out, target_mib, level, fmt, info, saturation,
         else:
             low = mid
 
-    # FIX: guard best_file access — if binary search produced nothing usable, fall through to CRF
     use_best = best_file and os.path.exists(best_file)
     final_file = best_file if use_best else (temp_out if os.path.exists(temp_out) else None)
     final_size = Path(final_file).stat().st_size if final_file else target_bytes * 2
@@ -349,7 +356,6 @@ def compress_video_animation(inp, out, target_mib, level, fmt, info, saturation,
         os.remove(temp_out)
 
 
-# FIX: accept info dict so we can use the real duration rather than 180s constant
 def compress_audio(inp: str, out: str, target_mib: int, level: str, fmt: dict, saturation: float, info: dict):
     duration = float(info["format"].get("duration", 180))
     target_kbps = max(32, int(target_mib * 1024 * 8 / max(duration, 1)))
@@ -381,7 +387,6 @@ def compress_image(inp: str, out: str, target_mib: int, level: str, fmt: dict, s
             vf_parts.append(sat_filter)
         vf = ",".join(vf_parts)
 
-        # FIX: define tmp fresh each iteration so there's no stale value from a prior loop
         tmp = None
 
         if name in ("PNG/JPEG", "PNG"):
@@ -411,7 +416,6 @@ def compress_image(inp: str, out: str, target_mib: int, level: str, fmt: dict, s
                 shutil.move(tmp, out)
             break
 
-        # FIX: warn user when quality is being degraded significantly
         new_q = max(25, q - 18)
         if new_q <= 30 and q > 30:
             console.print("[yellow]Quality is very low — result may look degraded[/yellow]")
@@ -424,21 +428,8 @@ def compress_image(inp: str, out: str, target_mib: int, level: str, fmt: dict, s
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main():
-    check_ffmpeg()
-
-    console.print(Panel.fit(
-        "[bold cyan]OFFLINE MEDIA COMPRESSOR[/]\n"
-        "Smart FFmpeg compressor — target size + saturation control",
-        border_style="cyan"
-    ))
-
-    config = load_config()
-    # FIX: use .get() with defaults everywhere to survive a corrupted/partial config
-    config.setdefault("two_pass", True)
-    config.setdefault("gpu", False)
-    config.setdefault("scene_detect", True)
-    save_config(config)
+def compress_one(config: dict) -> dict:
+    """Run a single compression job. Returns the (possibly updated) config."""
 
     remembered_folder = config.get("output_folder")
 
@@ -504,7 +495,7 @@ def main():
     choice = questionary.select("Target size (MiB)", choices=size_choices).ask()
     if choice is None:
         console.print("[yellow]Cancelled[/yellow]")
-        return
+        return config
 
     if "Custom" in choice:
         target_mib = IntPrompt.ask("Custom size (MiB)", default=10)
@@ -517,7 +508,7 @@ def main():
     fmt_choices = [f"{f['name']}  •  {f['group']}" for f in FORMATS]
     fmt_str = questionary.select("Output format", choices=fmt_choices).ask()
     if fmt_str is None:
-        return
+        return config
     fmt_name = fmt_str.split("  •  ")[0]
     fmt = next(f for f in FORMATS if f["name"] == fmt_name)
 
@@ -526,7 +517,7 @@ def main():
         choices=COMPRESSION_LEVELS
     ).ask()
     if level is None:
-        return
+        return config
 
     two_pass_raw = questionary.text(
         f"2-pass encoding? (Y/n) [default: {'Y' if config.get('two_pass') else 'N'}]",
@@ -535,7 +526,6 @@ def main():
 
     use_2pass = (two_pass_raw != "n")
     config["two_pass"] = use_2pass
-    save_config(config)
     console.print(f"→ 2-pass: [bold]{'ON' if use_2pass else 'OFF'}[/]")
 
     gpu_raw = questionary.text(
@@ -552,13 +542,11 @@ def main():
         use_gpu = (gpu_raw == "y")
 
     config["gpu"] = use_gpu
-    save_config(config)
 
     if use_gpu and use_2pass:
         console.print("[yellow]GPU encoding does not support true 2-pass → disabling 2-pass[/yellow]")
         use_2pass = False
         config["two_pass"] = False
-        save_config(config)
         console.print(f"→ 2-pass: [bold]OFF[/]")
 
     console.print(f"→ GPU: [bold]{'ON' if use_gpu else 'OFF'}[/]")
@@ -570,7 +558,6 @@ def main():
 
     use_scene = (scene_raw != "n")
     config["scene_detect"] = use_scene
-    save_config(config)
     console.print(f"→ Scene complexity detection: [bold]{'ON' if use_scene else 'OFF'}[/]")
 
     saturation_raw = questionary.text(
@@ -587,6 +574,9 @@ def main():
 
     console.print(f"→ Saturation: [bold]{saturation}%[/]")
 
+    # Save all config changes in one go
+    save_config(config)
+
     # Output path
     base_name = input_path.stem + "_compressed"
     out = output_folder / (base_name + fmt["ext"])
@@ -601,29 +591,62 @@ def main():
     else:
         console.print(f"→ Saving as: [bold]{out.name}[/]")
 
-    with console.status("[bold green]Compressing... (may take a while)", spinner="dots12"):
-        try:
-            if kind in ("video", "animation"):
-                compress_video_animation(
-                    str(input_path), str(out), target_mib, level,
-                    fmt, info, saturation, use_2pass, use_gpu, use_scene
-                )
-            elif kind == "audio":
-                # FIX: pass info so duration is read from the file, not hardcoded
-                compress_audio(str(input_path), str(out), target_mib, level, fmt, saturation, info)
-            elif kind == "image":
-                compress_image(str(input_path), str(out), target_mib, level, fmt, saturation)
-            else:
-                console.print("[yellow]Unsupported type — copying[/yellow]")
-                shutil.copy(input_path, out)
-        except Exception as e:
-            console.print(f"[bold red]Failed:[/] {e}")
-            return
+    console.print("[bold green]Compressing...[/bold green]")
+
+    try:
+        if kind in ("video", "animation"):
+            compress_video_animation(
+                str(input_path), str(out), target_mib, level,
+                fmt, info, saturation, use_2pass, use_gpu, use_scene
+            )
+        elif kind == "audio":
+            compress_audio(str(input_path), str(out), target_mib, level, fmt, saturation, info)
+        elif kind == "image":
+            compress_image(str(input_path), str(out), target_mib, level, fmt, saturation)
+        else:
+            console.print("[yellow]Unsupported type — copying[/yellow]")
+            shutil.copy(input_path, out)
+    except Exception as e:
+        console.print(f"[bold red]Failed:[/] {e}")
+        return config
 
     if out.is_file():
         size_mb = out.stat().st_size / 1_048_576
         console.print(f"\n[bold green]Done![/]   Size: [bold]{size_mb:.2f} MiB[/]")
         console.print(f"   → [bold]{out}[/bold]")
+
+    return config
+
+
+def main():
+    check_ffmpeg()
+
+    console.print(Panel.fit(
+        "[bold cyan]OFFLINE MEDIA COMPRESSOR[/]\n"
+        "Smart FFmpeg compressor — target size + saturation control",
+        border_style="cyan"
+    ))
+
+    config = load_config()
+    config.setdefault("two_pass", True)
+    config.setdefault("gpu", False)
+    config.setdefault("scene_detect", True)
+    save_config(config)
+
+    while True:
+        config = compress_one(config)
+
+        console.print()
+        again = questionary.text(
+            "Compress another file? (Y/n)",
+            default="y"
+        ).ask()
+
+        if again is None or again.strip().lower() == "n":
+            console.print("[dim]Goodbye![/dim]")
+            break
+
+        console.print()
 
 
 if __name__ == "__main__":

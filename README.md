@@ -25,7 +25,7 @@ Compress videos, images, and audio files to a target file size with smart qualit
   * GPU setting
 * Creates `compressed_output` folder next to the script by default
 * Avoids overwriting files (adds _1, _2, … when needed)
-* 100% local — no internet required
+* 100% local - no internet required
 
 ## Supported formats
 

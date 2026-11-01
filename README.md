@@ -137,7 +137,7 @@ Playlists are saved into their own subfolder, numbered in playlist order. A vide
 
 ## Example run
 
-![example](https://raw.githubusercontent.com/Limitrious/compressor/refs/heads/main/example.png)
+![example](https://raw.githubusercontent.com/Limitrious/ratecap/refs/heads/main/example.png)
 
 ## Notes
 
